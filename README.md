@@ -1,52 +1,45 @@
-# Go PostgreSQL CDC Example
+# Go PostgreSQL CDC Tool
 
-A Change Data Capture (CDC) tool for PostgreSQL written in Go, supporting multiple databases and Debezium-like output format.
+A Change Data Capture (CDC) tool for PostgreSQL written in Go, implementing logical replication to capture database changes in real-time.
 
-## Features Implemented
+## Features
 
-- Connects to multiple PostgreSQL databases concurrently using logical replication
-- Uses the `pgoutput` logical decoding plugin
-- Auto-creates replication slots and publications if they don't exist
-- (Optional) Drops inactive logical replication slots on startup
-- Loads and saves Log Sequence Number (LSN) offsets per database
-- Periodically flushes the last processed LSN to offset files
-- Flushes LSN on graceful shutdown (Ctrl+C / SIGTERM)
-- Parses `INSERT`, `UPDATE`, `DELETE` messages
-- Outputs change events to standard output in Debezium-like JSON format
-- Handles keepalive messages and sends standby status updates
-- Supports initial snapshots of existing data
+- Real-time change capture using PostgreSQL logical replication
+- Support for multiple databases
+- Automatic failover with active/standby instances
+- Circuit breaker pattern for handling database connection issues
+- Metrics endpoint for monitoring
+- Offset tracking for reliable message delivery
+- Graceful shutdown handling
 
-## Prerequisites
+## Requirements
 
-1. **Go:** Version 1.24.0 or later installed
-2. **PostgreSQL:** Version 10 or later
-3. **PostgreSQL Configuration (`postgresql.conf`):**
-   - `wal_level = logical` (Requires server restart after change)
-   - `max_replication_slots = N` (Set `N` high enough, e.g., 10. Requires restart.)
-   - Ensure network connectivity allows connection from where the tool runs
-4. **PostgreSQL User & Permissions:**
-   - Create a dedicated user for each database:
-     ```sql
-     CREATE USER my_cdc_user REPLICATION LOGIN PASSWORD 'your_password';
-     ```
-   - Grant connect permission on the database:
-     ```sql
-     GRANT CONNECT ON DATABASE your_database TO my_cdc_user;
-     ```
-   - Grant USAGE on the schema(s) containing the tables:
-     ```sql
-     GRANT USAGE ON SCHEMA public TO my_cdc_user; -- Or your specific schema
-     ```
-   - Grant SELECT on the tables you want to capture:
-     ```sql
-     GRANT SELECT ON ALL TABLES IN SCHEMA public TO my_cdc_user;
-     ```
-5. **Table REPLICA IDENTITY:**
-   - For `UPDATE` and `DELETE` events to include the *before* data (`payload.before`), tables need adequate `REPLICA IDENTITY`:
-     ```sql
-     -- Recommended for full before/after data:
-     ALTER TABLE your_table REPLICA IDENTITY FULL;
-     ```
+- Go 1.16 or later
+- PostgreSQL 10 or later with logical replication enabled
+
+### PostgreSQL Configuration
+
+The following settings must be configured in your PostgreSQL server's `postgresql.conf`:
+
+```ini
+# Enable logical replication
+wal_level = logical
+
+# Increase the number of replication connections
+max_wal_senders = 20
+
+# Increase the number of replication slots
+max_replication_slots = 20
+```
+
+To apply these changes:
+1. Edit your postgresql.conf file (usually located in /etc/postgresql/[version]/main/)
+2. Set the values as shown above
+3. Restart PostgreSQL: `sudo systemctl restart postgresql`
+
+Note: The values shown are minimum recommendations. You may need to adjust them based on your specific needs:
+- `max_wal_senders`: Each replication connection requires one sender. Set this higher if you have multiple replicas or tools using replication.
+- `max_replication_slots`: Each logical replication consumer requires a slot. Set this higher if you have multiple consumers.
 
 ## Configuration
 
