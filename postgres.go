@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pglogrepl"
@@ -16,7 +17,10 @@ import (
 var relations = make(map[uint32]*Relation) // OID -> Relation Info
 
 // Holds circuit breakers for each database
-var circuitBreakers = make(map[string]*CircuitBreaker)
+var (
+	circuitBreakers = make(map[string]*CircuitBreaker)
+	circuitMu       sync.RWMutex // Protect circuitBreakers map
+)
 
 // ConnectDB establishes a connection to the PostgreSQL database with retry and circuit breaker
 func ConnectDB(ctx context.Context, connStr string) (*pgconn.PgConn, error) {
@@ -27,11 +31,13 @@ func ConnectDB(ctx context.Context, connStr string) (*pgconn.PgConn, error) {
 	)
 
 	// Get or create circuit breaker for this connection
+	circuitMu.Lock()
 	cb, exists := circuitBreakers[connStr]
 	if !exists {
 		cb = NewCircuitBreaker()
 		circuitBreakers[connStr] = cb
 	}
+	circuitMu.Unlock()
 
 	// Check if we can proceed based on circuit breaker state
 	if !cb.CanProceed() {
@@ -47,13 +53,45 @@ func ConnectDB(ctx context.Context, connStr string) (*pgconn.PgConn, error) {
 			return fmt.Errorf("failed to parse connection string: %w", err)
 		}
 		connConfig.RuntimeParams["replication"] = "database"
+		connConfig.RuntimeParams["application_name"] = "go_cdc" // Add application name for better tracking
 
 		conn, err = pgconn.ConnectConfig(ctx, connConfig)
 		if err != nil {
 			cb.RecordFailure()
 			errorMetrics.IncrementError("database")
+
+			// Check if error is due to max_wal_senders
+			if strings.Contains(err.Error(), "max_wal_senders") {
+				// Wait longer before retrying to allow other connections to close
+				time.Sleep(10 * time.Second)
+
+				// Try to clean up any stale replication slots
+				if cleanupConn, err := pgconn.Connect(ctx, connStr); err == nil {
+					defer cleanupConn.Close(ctx)
+					cleanupQuery := `
+						SELECT pg_terminate_backend(pid) 
+						FROM pg_stat_activity 
+						WHERE application_name = 'go_cdc' 
+						AND state = 'idle' 
+						AND pid != pg_backend_pid()
+					`
+					_, _ = cleanupConn.Exec(ctx, cleanupQuery).ReadAll()
+				}
+			}
 			return fmt.Errorf("failed to connect to database for replication: %w", err)
 		}
+
+		// Verify replication capability by checking if we can query replication status
+		query := "SELECT 1 FROM pg_stat_replication"
+		mrr := conn.Exec(ctx, query)
+		_, err = mrr.ReadAll()
+		if err != nil {
+			conn.Close(ctx)
+			cb.RecordFailure()
+			errorMetrics.IncrementError("database")
+			return fmt.Errorf("failed to verify replication capability: %w", err)
+		}
+
 		return nil
 	})
 
@@ -79,8 +117,21 @@ func EnsureReplicationSlot(ctx context.Context, conn *pgconn.PgConn, slotName, o
 
 	// If slot doesn't exist, create it
 	if len(results) == 0 || len(results[0].Rows) == 0 {
+		// Drop any existing slot with the same name (in case it's in an invalid state)
+		dropQuery := fmt.Sprintf("SELECT pg_drop_replication_slot('%s')", slotName)
+		_, _ = conn.Exec(ctx, dropQuery).ReadAll() // Ignore error as slot might not exist
+
+		// Wait a bit to ensure the drop is processed
+		time.Sleep(1 * time.Second)
+
+		// Create the slot
 		_, err = pglogrepl.CreateReplicationSlot(ctx, conn, slotName, outputPlugin, pglogrepl.CreateReplicationSlotOptions{Mode: pglogrepl.LogicalReplication})
 		if err != nil {
+			// If we get a "slot already exists" error, it might be a race condition
+			if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == "42710" {
+				log.Printf("Slot '%s' already exists (race condition), continuing...", slotName)
+				return false, nil
+			}
 			return false, fmt.Errorf("failed to create replication slot '%s': %w", slotName, err)
 		}
 		log.Printf("Replication slot '%s' created successfully.", slotName)
@@ -155,8 +206,25 @@ func StartReplicationStream(ctx context.Context, conn *pgconn.PgConn, dbConfig D
 			continue
 		}
 
+		// Ensure replication slot exists before starting replication
+		_, err := EnsureReplicationSlot(ctx, conn, dbConfig.SlotName, "pgoutput")
+		if err != nil {
+			cb.RecordFailure()
+			errorMetrics.IncrementError("database")
+			log.Printf("Failed to ensure replication slot '%s' for %s: %v", dbConfig.SlotName, dbConfig.ConnStr, err)
+
+			// Try to reconnect
+			newConn, err := ConnectDB(ctx, dbConfig.ConnStr)
+			if err != nil {
+				log.Printf("Failed to reconnect to %s: %v", dbConfig.ConnStr, err)
+				continue
+			}
+			conn = newConn
+			continue
+		}
+
 		// Retry starting replication with backoff
-		err := RetryWithBackoff(ctx, LoadConfig(), "start replication", func() error {
+		err = RetryWithBackoff(ctx, LoadConfig(), "start replication", func() error {
 			pluginArguments := []string{"proto_version '1'", fmt.Sprintf("publication_names '%s'", dbConfig.PublicationName)}
 			return pglogrepl.StartReplication(ctx, conn, dbConfig.SlotName, startLSN, pglogrepl.StartReplicationOptions{
 				PluginArgs: pluginArguments,
