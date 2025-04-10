@@ -54,17 +54,60 @@ func main() {
 			startLSN := LoadInitialLSN(offsetFile)
 			SetCurrentLSN(startLSN)
 
+			// Initialize database info
+			dbInfo := DatabaseInfo{
+				ConnStr:         dbConfig.ConnStr,
+				SlotName:        dbConfig.SlotName,
+				PublicationName: dbConfig.PublicationName,
+				Status:          "connecting",
+				ConnectedSince:  time.Now(),
+			}
+
+			// Add database info to metrics
+			errorMetrics.mu.Lock()
+			errorMetrics.Databases = append(errorMetrics.Databases, dbInfo)
+			errorMetrics.mu.Unlock()
+
 			// Connect to database
 			conn, err := ConnectDB(ctx, dbConfig.ConnStr)
 			if err != nil {
 				log.Printf("FATAL: Database connection failed for %s: %v", dbConfig.ConnStr, err)
+				errorMetrics.mu.Lock()
+				for i, db := range errorMetrics.Databases {
+					if db.ConnStr == dbConfig.ConnStr {
+						errorMetrics.Databases[i].Status = "error"
+						errorMetrics.Databases[i].LastError = err.Error()
+						errorMetrics.Databases[i].CircuitState = circuitBreakers[dbConfig.ConnStr].GetState()
+					}
+				}
+				errorMetrics.mu.Unlock()
 				return
 			}
+
+			// Update database status
+			errorMetrics.mu.Lock()
+			for i, db := range errorMetrics.Databases {
+				if db.ConnStr == dbConfig.ConnStr {
+					errorMetrics.Databases[i].Status = "connected"
+					errorMetrics.Databases[i].CircuitState = circuitBreakers[dbConfig.ConnStr].GetState()
+				}
+			}
+			errorMetrics.mu.Unlock()
+
 			defer func() {
 				log.Printf("Closing database connection for %s...", dbConfig.ConnStr)
 				closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer closeCancel()
 				conn.Close(closeCtx)
+
+				// Update database status
+				errorMetrics.mu.Lock()
+				for i, db := range errorMetrics.Databases {
+					if db.ConnStr == dbConfig.ConnStr {
+						errorMetrics.Databases[i].Status = "disconnected"
+					}
+				}
+				errorMetrics.mu.Unlock()
 			}()
 
 			// Drop stale slots if enabled
@@ -143,12 +186,31 @@ func main() {
 
 			// Start replication stream
 			err = StartReplicationStream(ctx, conn, dbConfig, GetCurrentLSN(), func(msg pglogrepl.Message) error {
+				// Update last LSN
+				errorMetrics.mu.Lock()
+				for i, db := range errorMetrics.Databases {
+					if db.ConnStr == dbConfig.ConnStr {
+						errorMetrics.Databases[i].LastLSN = uint64(GetCurrentLSN())
+						errorMetrics.Databases[i].CircuitState = circuitBreakers[dbConfig.ConnStr].GetState()
+					}
+				}
+				errorMetrics.mu.Unlock()
+
 				return ProcessWALMessage(msg, &Config{
 					ConnectorName: dbConfig.PublicationName,
 				})
 			})
 			if err != nil && err != context.Canceled {
 				log.Printf("ERROR: Replication stream stopped for %s: %v", dbConfig.ConnStr, err)
+				errorMetrics.mu.Lock()
+				for i, db := range errorMetrics.Databases {
+					if db.ConnStr == dbConfig.ConnStr {
+						errorMetrics.Databases[i].Status = "error"
+						errorMetrics.Databases[i].LastError = err.Error()
+						errorMetrics.Databases[i].CircuitState = circuitBreakers[dbConfig.ConnStr].GetState()
+					}
+				}
+				errorMetrics.mu.Unlock()
 			}
 
 			// Wait for flusher to stop

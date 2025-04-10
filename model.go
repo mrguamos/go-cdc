@@ -42,15 +42,28 @@ type Relation struct {
 	ReplicaIdentity uint8                             // From RelationMessage.ReplicaIdentity ('d'=default, 'n'=nothing, 'f'=full, 'i'=index)
 }
 
+// DatabaseInfo tracks information about a database connection
+type DatabaseInfo struct {
+	ConnStr         string    `json:"conn_str"`
+	SlotName        string    `json:"slot_name"`
+	PublicationName string    `json:"publication_name"`
+	LastLSN         uint64    `json:"last_lsn"`
+	Status          string    `json:"status"`
+	LastError       string    `json:"last_error,omitempty"`
+	ConnectedSince  time.Time `json:"connected_since"`
+	CircuitState    string    `json:"circuit_state"`
+}
+
 // ErrorMetrics tracks error statistics for monitoring
 type ErrorMetrics struct {
-	TotalErrors      int64        `json:"total_errors"`
-	DatabaseErrors   int64        `json:"database_errors"`
-	ProcessingErrors int64        `json:"processing_errors"`
-	FileErrors       int64        `json:"file_errors"`
-	LastErrorTime    time.Time    `json:"last_error_time"`
-	ErrorRate        float64      `json:"error_rate"`
-	mu               sync.RWMutex // Protects all fields
+	TotalErrors      int64          `json:"total_errors"`
+	DatabaseErrors   int64          `json:"database_errors"`
+	ProcessingErrors int64          `json:"processing_errors"`
+	FileErrors       int64          `json:"file_errors"`
+	LastErrorTime    time.Time      `json:"last_error_time"`
+	ErrorRate        float64        `json:"error_rate"`
+	Databases        []DatabaseInfo `json:"databases"`
+	mu               sync.RWMutex   // Protects all fields
 }
 
 // NewErrorMetrics creates a new ErrorMetrics instance
