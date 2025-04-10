@@ -41,18 +41,24 @@ func ProcessWALMessage(logicalMsg pglogrepl.Message, cfg *Config) error {
 	case *pglogrepl.InsertMessage:
 		rel, ok := relations[msg.RelationID]
 		if !ok {
+			errorMetrics.IncrementError("processing")
 			return fmt.Errorf("insert: unknown relation ID %d, cannot process message", msg.RelationID)
 		}
 		values, err := parseTuple(rel, msg.Tuple)
 		if err != nil {
+			errorMetrics.IncrementError("processing")
 			return fmt.Errorf("insert: error parsing tuple for %s.%s: %w", rel.Namespace, rel.Name, err)
 		}
 		dbzMsg := createDebeziumMessage(rel, nil, values, "c", cfg, time.Now(), 0)
-		outputJSON(dbzMsg)
+		if err := outputJSON(dbzMsg); err != nil {
+			errorMetrics.IncrementError("processing")
+			return err
+		}
 
 	case *pglogrepl.UpdateMessage:
 		rel, ok := relations[msg.RelationID]
 		if !ok {
+			errorMetrics.IncrementError("processing")
 			return fmt.Errorf("update: unknown relation ID %d, cannot process message", msg.RelationID)
 		}
 		var oldValues map[string]interface{}
@@ -60,19 +66,25 @@ func ProcessWALMessage(logicalMsg pglogrepl.Message, cfg *Config) error {
 		if msg.OldTuple != nil {
 			oldValues, err = parseTuple(rel, msg.OldTuple)
 			if err != nil {
+				errorMetrics.IncrementError("processing")
 				return fmt.Errorf("update: error parsing old tuple for %s.%s: %w", rel.Namespace, rel.Name, err)
 			}
 		}
 		newValues, err := parseTuple(rel, msg.NewTuple)
 		if err != nil {
+			errorMetrics.IncrementError("processing")
 			return fmt.Errorf("update: error parsing new tuple for %s.%s: %w", rel.Namespace, rel.Name, err)
 		}
 		dbzMsg := createDebeziumMessage(rel, oldValues, newValues, "u", cfg, time.Now(), 0)
-		outputJSON(dbzMsg)
+		if err := outputJSON(dbzMsg); err != nil {
+			errorMetrics.IncrementError("processing")
+			return err
+		}
 
 	case *pglogrepl.DeleteMessage:
 		rel, ok := relations[msg.RelationID]
 		if !ok {
+			errorMetrics.IncrementError("processing")
 			return fmt.Errorf("delete: unknown relation ID %d, cannot process message", msg.RelationID)
 		}
 		var oldValues map[string]interface{}
@@ -80,11 +92,15 @@ func ProcessWALMessage(logicalMsg pglogrepl.Message, cfg *Config) error {
 		if msg.OldTuple != nil {
 			oldValues, err = parseTuple(rel, msg.OldTuple)
 			if err != nil {
+				errorMetrics.IncrementError("processing")
 				return fmt.Errorf("delete: error parsing old tuple for %s.%s: %w", rel.Namespace, rel.Name, err)
 			}
 		}
 		dbzMsg := createDebeziumMessage(rel, oldValues, nil, "d", cfg, time.Now(), 0)
-		outputJSON(dbzMsg)
+		if err := outputJSON(dbzMsg); err != nil {
+			errorMetrics.IncrementError("processing")
+			return err
+		}
 
 	case *pglogrepl.TruncateMessage:
 		log.Printf("Truncate: Relation IDs: %v, Options: %d", msg.RelationIDs, msg.Option)
@@ -158,16 +174,16 @@ func createDebeziumMessage(rel *Relation, before, after map[string]interface{}, 
 }
 
 // outputJSON prints the Debezium message to stdout, handling potential errors.
-func outputJSON(msg *DebeziumMessage) {
+func outputJSON(msg *DebeziumMessage) error {
 	// Use compact JSON encoding for output efficiency
 	jsonData, err := json.Marshal(msg)
 	if err != nil {
-		log.Printf("ERROR: Failed to marshal Debezium message for %s.%s (op %s) to JSON: %v",
+		errorMetrics.IncrementError("processing")
+		return fmt.Errorf("failed to marshal Debezium message for %s.%s (op %s) to JSON: %w",
 			msg.Payload.Source.Schema, msg.Payload.Source.Table, msg.Payload.Op, err)
-		// Consider how to handle marshalling errors - skip message, log details, stop?
-		return // Skip outputting this message
 	}
 	emitEvent(jsonData)
+	return nil
 }
 
 func emitEvent(jsonData []byte) {

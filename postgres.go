@@ -15,19 +15,54 @@ import (
 // Holds schema information for tables encountered
 var relations = make(map[uint32]*Relation) // OID -> Relation Info
 
-// ConnectDB establishes a connection to the PostgreSQL database.
-func ConnectDB(ctx context.Context, connStr string) (*pgconn.PgConn, error) {
-	connConfig, err := pgconn.ParseConfig(connStr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse connection string: %w", err)
-	}
-	// Ensure Replication mode is set for pgconn
-	connConfig.RuntimeParams["replication"] = "database"
+// Holds circuit breakers for each database
+var circuitBreakers = make(map[string]*CircuitBreaker)
 
-	conn, err := pgconn.ConnectConfig(ctx, connConfig)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to database for replication: %w", err)
+// ConnectDB establishes a connection to the PostgreSQL database with retry and circuit breaker
+func ConnectDB(ctx context.Context, connStr string) (*pgconn.PgConn, error) {
+	cfg := LoadConfig()
+	var (
+		conn *pgconn.PgConn
+		err  error
+	)
+
+	// Get or create circuit breaker for this connection
+	cb, exists := circuitBreakers[connStr]
+	if !exists {
+		cb = NewCircuitBreaker()
+		circuitBreakers[connStr] = cb
 	}
+
+	// Check if we can proceed based on circuit breaker state
+	if !cb.CanProceed() {
+		errorMetrics.IncrementError("database")
+		return nil, fmt.Errorf("circuit breaker is open for connection %s, last failure: %v", connStr, cb.LastFailureTime)
+	}
+
+	err = RetryWithBackoff(ctx, cfg, "database connection", func() error {
+		connConfig, err := pgconn.ParseConfig(connStr)
+		if err != nil {
+			cb.RecordFailure()
+			errorMetrics.IncrementError("database")
+			return fmt.Errorf("failed to parse connection string: %w", err)
+		}
+		connConfig.RuntimeParams["replication"] = "database"
+
+		conn, err = pgconn.ConnectConfig(ctx, connConfig)
+		if err != nil {
+			cb.RecordFailure()
+			errorMetrics.IncrementError("database")
+			return fmt.Errorf("failed to connect to database for replication: %w", err)
+		}
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	// Connection successful, reset circuit breaker
+	cb.RecordSuccess()
 	log.Println("Successfully connected to PostgreSQL in replication mode")
 	return conn, nil
 }
@@ -97,114 +132,161 @@ func DropInactiveReplicationSlots(ctx context.Context, conn *pgconn.PgConn, curr
 	return nil
 }
 
-// StartReplicationStream starts the logical replication process.
+// StartReplicationStream starts the logical replication process with automatic recovery
 func StartReplicationStream(ctx context.Context, conn *pgconn.PgConn, dbConfig DatabaseConfig, startLSN pglogrepl.LSN, messageProcessor func(msg pglogrepl.Message) error) error {
 	log.Printf("Starting replication on slot '%s' from LSN %s", dbConfig.SlotName, startLSN)
 
-	pluginArguments := []string{"proto_version '1'", fmt.Sprintf("publication_names '%s'", dbConfig.PublicationName)}
-	err := pglogrepl.StartReplication(ctx, conn, dbConfig.SlotName, startLSN, pglogrepl.StartReplicationOptions{
-		PluginArgs: pluginArguments,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to start replication: %w", err)
-	}
-	log.Println("Replication stream started successfully")
-
-	// Use a separate timer for sending standby status updates
-	standbyUpdateInterval := 10 * time.Second
-	nextStandbyStatusUpdateTime := time.Now().Add(standbyUpdateInterval)
-	clientLSN := startLSN
-	lastProcessedLSN := startLSN // Track the last successfully processed LSN
+	// Get circuit breaker for this connection
+	cb := circuitBreakers[dbConfig.ConnStr]
 
 	for {
-		if ctx.Err() != nil {
-			log.Println("Replication context cancelled, stopping stream.")
-			return ctx.Err()
+		if !cb.CanProceed() {
+			log.Printf("Circuit breaker is open for %s, waiting before retry...", dbConfig.ConnStr)
+			errorMetrics.IncrementError("database")
+			time.Sleep(5 * time.Minute)
+			continue
 		}
 
-		receiveCtx, cancelReceive := context.WithTimeout(ctx, standbyUpdateInterval)
-		rawMsg, err := conn.ReceiveMessage(receiveCtx)
-		cancelReceive()
-
+		// Retry starting replication with backoff
+		err := RetryWithBackoff(ctx, LoadConfig(), "start replication", func() error {
+			pluginArguments := []string{"proto_version '1'", fmt.Sprintf("publication_names '%s'", dbConfig.PublicationName)}
+			return pglogrepl.StartReplication(ctx, conn, dbConfig.SlotName, startLSN, pglogrepl.StartReplicationOptions{
+				PluginArgs: pluginArguments,
+			})
+		})
 		if err != nil {
-			if pgconn.Timeout(err) || strings.Contains(err.Error(), "context deadline exceeded") {
-				// do nothing
-			} else if ctx.Err() != nil {
-				log.Println("ReceiveMessage interrupted by main context cancellation.")
-				return ctx.Err()
-			} else {
-				return fmt.Errorf("failed to receive replication message: %w", err)
-			}
-		}
+			cb.RecordFailure()
+			errorMetrics.IncrementError("database")
+			log.Printf("Failed to start replication for %s: %v", dbConfig.ConnStr, err)
 
-		if rawMsg != nil {
-			if errMsg, ok := rawMsg.(*pgproto3.ErrorResponse); ok {
-				return fmt.Errorf("received PostgreSQL error: %+v", errMsg)
-			}
-
-			msg, ok := rawMsg.(*pgproto3.CopyData)
-			if !ok {
-				log.Printf("WARN: Received unexpected message type: %T", rawMsg)
+			// Try to reconnect
+			newConn, err := ConnectDB(ctx, dbConfig.ConnStr)
+			if err != nil {
+				log.Printf("Failed to reconnect to %s: %v", dbConfig.ConnStr, err)
 				continue
 			}
-
-			switch msg.Data[0] {
-			case pglogrepl.PrimaryKeepaliveMessageByteID:
-				pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(msg.Data[1:])
-				if err != nil {
-					log.Printf("WARN: Failed to parse primary keepalive message: %v", err)
-					continue
-				}
-
-				if pkm.ReplyRequested {
-					nextStandbyStatusUpdateTime = time.Now()
-				}
-
-			case pglogrepl.XLogDataByteID:
-				xld, err := pglogrepl.ParseXLogData(msg.Data[1:])
-				if err != nil {
-					log.Printf("ERROR: Failed to parse XLogData: %v", err)
-					continue
-				}
-
-				logicalMsg, err := pglogrepl.Parse(xld.WALData)
-				if err != nil {
-					log.Printf("ERROR: Failed to parse logical replication message: %v", err)
-					continue
-				}
-
-				err = messageProcessor(logicalMsg)
-				if err != nil {
-					log.Printf("ERROR: Failed to process message at LSN %s: %v", xld.WALStart, err)
-					continue
-				}
-
-				clientLSN = xld.WALStart + pglogrepl.LSN(len(xld.WALData))
-				lastProcessedLSN = clientLSN
-				SetCurrentLSN(clientLSN)
-
-			default:
-				log.Printf("WARN: Received unknown CopyData message type: %x", msg.Data[0])
-			}
+			conn = newConn
+			continue
 		}
 
-		now := time.Now()
-		if now.After(nextStandbyStatusUpdateTime) || (rawMsg != nil && rawMsg.(*pgproto3.CopyData).Data[0] == pglogrepl.PrimaryKeepaliveMessageByteID && mustReplyToKeepalive(rawMsg.(*pgproto3.CopyData).Data)) {
-			if lastProcessedLSN > 0 {
-				err = pglogrepl.SendStandbyStatusUpdate(ctx, conn, pglogrepl.StandbyStatusUpdate{
-					WALWritePosition: lastProcessedLSN,
-					WALFlushPosition: lastProcessedLSN,
-					WALApplyPosition: lastProcessedLSN,
-				})
-				if err != nil {
-					log.Printf("ERROR: Failed to send standby status update (LSN %s): %v", lastProcessedLSN, err)
-					if ctx.Err() != nil {
-						return ctx.Err()
+		// Replication started successfully
+		cb.RecordSuccess()
+		log.Println("Replication stream started successfully")
+
+		// Use a separate timer for sending standby status updates
+		standbyUpdateInterval := 10 * time.Second
+		nextStandbyStatusUpdateTime := time.Now().Add(standbyUpdateInterval)
+		lastProcessedLSN := startLSN
+
+		for {
+			if ctx.Err() != nil {
+				log.Println("Replication context cancelled, stopping stream.")
+				return ctx.Err()
+			}
+
+			receiveCtx, cancelReceive := context.WithTimeout(ctx, standbyUpdateInterval)
+			rawMsg, err := conn.ReceiveMessage(receiveCtx)
+			cancelReceive()
+
+			if err != nil {
+				if pgconn.Timeout(err) || strings.Contains(err.Error(), "context deadline exceeded") {
+					// Normal timeout, continue
+					continue
+				} else if ctx.Err() != nil {
+					log.Println("ReceiveMessage interrupted by main context cancellation.")
+					return ctx.Err()
+				} else {
+					// Network error or other issue
+					cb.RecordFailure()
+					log.Printf("Error receiving message from %s: %v", dbConfig.ConnStr, err)
+					break // Break inner loop to attempt reconnection
+				}
+			}
+
+			if rawMsg != nil {
+				if errMsg, ok := rawMsg.(*pgproto3.ErrorResponse); ok {
+					cb.RecordFailure()
+					log.Printf("Received PostgreSQL error: %+v", errMsg)
+					break
+				}
+
+				msg, ok := rawMsg.(*pgproto3.CopyData)
+				if !ok {
+					log.Printf("WARN: Received unexpected message type: %T", rawMsg)
+					continue
+				}
+
+				switch msg.Data[0] {
+				case pglogrepl.PrimaryKeepaliveMessageByteID:
+					pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(msg.Data[1:])
+					if err != nil {
+						log.Printf("WARN: Failed to parse primary keepalive message: %v", err)
+						continue
+					}
+
+					if pkm.ReplyRequested {
+						nextStandbyStatusUpdateTime = time.Now()
+					}
+
+				case pglogrepl.XLogDataByteID:
+					xld, err := pglogrepl.ParseXLogData(msg.Data[1:])
+					if err != nil {
+						cb.RecordFailure()
+						log.Printf("ERROR: Failed to parse XLogData: %v", err)
+						continue
+					}
+
+					logicalMsg, err := pglogrepl.Parse(xld.WALData)
+					if err != nil {
+						cb.RecordFailure()
+						log.Printf("ERROR: Failed to parse logical replication message: %v", err)
+						continue
+					}
+
+					err = messageProcessor(logicalMsg)
+					if err != nil {
+						cb.RecordFailure()
+						log.Printf("ERROR: Failed to process message at LSN %s: %v", xld.WALStart, err)
+						continue
+					}
+
+					lastProcessedLSN = xld.WALStart + pglogrepl.LSN(len(xld.WALData))
+					SetCurrentLSN(lastProcessedLSN)
+
+				default:
+					log.Printf("WARN: Received unknown CopyData message type: %x", msg.Data[0])
+				}
+			}
+
+			// Update standby status with retry
+			now := time.Now()
+			if now.After(nextStandbyStatusUpdateTime) || (rawMsg != nil && rawMsg.(*pgproto3.CopyData).Data[0] == pglogrepl.PrimaryKeepaliveMessageByteID && mustReplyToKeepalive(rawMsg.(*pgproto3.CopyData).Data)) {
+				if lastProcessedLSN > 0 {
+					err = RetryWithBackoff(ctx, LoadConfig(), "send standby status", func() error {
+						return pglogrepl.SendStandbyStatusUpdate(ctx, conn, pglogrepl.StandbyStatusUpdate{
+							WALWritePosition: lastProcessedLSN,
+							WALFlushPosition: lastProcessedLSN,
+							WALApplyPosition: lastProcessedLSN,
+						})
+					})
+					if err != nil {
+						cb.RecordFailure()
+						log.Printf("Failed to send standby status update for %s: %v", dbConfig.ConnStr, err)
+						break // Break inner loop to attempt reconnection
 					}
 				}
+				nextStandbyStatusUpdateTime = now.Add(standbyUpdateInterval)
 			}
-			nextStandbyStatusUpdateTime = now.Add(standbyUpdateInterval)
 		}
+
+		// If we get here, we need to reconnect
+		log.Printf("Attempting to reconnect to %s...", dbConfig.ConnStr)
+		newConn, err := ConnectDB(ctx, dbConfig.ConnStr)
+		if err != nil {
+			log.Printf("Failed to reconnect to %s: %v", dbConfig.ConnStr, err)
+			continue
+		}
+		conn = newConn
 	}
 }
 
@@ -297,4 +379,33 @@ func PerformInitialSnapshot(ctx context.Context, conn *pgconn.PgConn, dbConfig D
 		}
 	}
 	return nil
+}
+
+// RetryWithBackoff executes a function with exponential backoff retry
+func RetryWithBackoff(ctx context.Context, cfg *Config, operation string, fn func() error) error {
+	var lastErr error
+	backoff := cfg.RetryConfig.InitialBackoff
+
+	for attempt := 0; attempt < cfg.RetryConfig.MaxRetries; attempt++ {
+		if err := fn(); err != nil {
+			lastErr = err
+			log.Printf("Attempt %d/%d failed for %s: %v", attempt+1, cfg.RetryConfig.MaxRetries, operation, err)
+
+			if attempt < cfg.RetryConfig.MaxRetries-1 {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(backoff):
+					backoff = time.Duration(float64(backoff) * cfg.RetryConfig.BackoffMultiplier)
+					if backoff > cfg.RetryConfig.MaxBackoff {
+						backoff = cfg.RetryConfig.MaxBackoff
+					}
+				}
+				continue
+			}
+			return fmt.Errorf("failed after %d attempts: %w", cfg.RetryConfig.MaxRetries, lastErr)
+		}
+		return nil
+	}
+	return lastErr
 }

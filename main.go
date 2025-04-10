@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -11,6 +13,10 @@ import (
 	"time"
 
 	"github.com/jackc/pglogrepl" // Ensure pglogrepl is imported if used directly here, though it's mostly in postgres.go
+)
+
+var (
+	errorMetrics = NewErrorMetrics()
 )
 
 func main() {
@@ -149,6 +155,18 @@ func main() {
 			flusherWg.Wait()
 		}(dbConfig)
 	}
+
+	// Start metrics server
+	go func() {
+		http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(errorMetrics)
+		})
+		log.Println("Starting metrics server on :8080")
+		if err := http.ListenAndServe(":8080", nil); err != nil {
+			log.Printf("Metrics server error: %v", err)
+		}
+	}()
 
 	// Wait for all database CDC processes to complete
 	wg.Wait()

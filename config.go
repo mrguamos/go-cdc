@@ -21,6 +21,15 @@ type Config struct {
 	OffsetFile        string           `yaml:"offset_file"`
 	InactiveSlotCheck bool             `yaml:"inactive_slot_check"`
 	Databases         []DatabaseConfig `yaml:"databases"`
+	RetryConfig       RetryConfig      `yaml:"retry_config"`
+}
+
+// RetryConfig defines retry behavior for various operations
+type RetryConfig struct {
+	MaxRetries        int           `yaml:"max_retries"`
+	InitialBackoff    time.Duration `yaml:"initial_backoff"`
+	MaxBackoff        time.Duration `yaml:"max_backoff"`
+	BackoffMultiplier float64       `yaml:"backoff_multiplier"`
 }
 
 // getEnv gets an environment variable or returns a default value
@@ -54,6 +63,20 @@ func LoadConfig() *Config {
 	}
 	if cfg.OffsetFile == "" {
 		cfg.OffsetFile = "offset.json"
+	}
+
+	// Set retry defaults
+	if cfg.RetryConfig.MaxRetries == 0 {
+		cfg.RetryConfig.MaxRetries = 3
+	}
+	if cfg.RetryConfig.InitialBackoff == 0 {
+		cfg.RetryConfig.InitialBackoff = 1 * time.Second
+	}
+	if cfg.RetryConfig.MaxBackoff == 0 {
+		cfg.RetryConfig.MaxBackoff = 30 * time.Second
+	}
+	if cfg.RetryConfig.BackoffMultiplier == 0 {
+		cfg.RetryConfig.BackoffMultiplier = 2.0
 	}
 
 	return &cfg

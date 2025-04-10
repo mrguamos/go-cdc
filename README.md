@@ -57,6 +57,11 @@ connector_name: "go-cdc"
 flush_interval: 10s
 offset_file: "offset.json"
 inactive_slot_check: true
+retry_config:
+  max_retries: 3
+  initial_backoff: 1s
+  max_backoff: 30s
+  backoff_multiplier: 2.0
 
 databases:
   - conn_str: "postgres://user1:pass1@host1:5432/db1"
@@ -78,6 +83,11 @@ Configuration options:
 - `flush_interval`: How often to flush LSN offsets to disk
 - `offset_file`: Base name for offset files (each database will append its slot name)
 - `inactive_slot_check`: Whether to drop inactive replication slots on startup
+- `retry_config`: Configuration for retry behavior
+  - `max_retries`: Maximum number of retry attempts (default: 3)
+  - `initial_backoff`: Initial wait time between retries (default: 1s)
+  - `max_backoff`: Maximum wait time between retries (default: 30s)
+  - `backoff_multiplier`: Factor to multiply backoff by each retry (default: 2.0)
 - `databases`: List of database configurations
   - `conn_str`: PostgreSQL connection string
   - `slot_name`: Replication slot name (must be unique)
@@ -163,3 +173,30 @@ The application handles graceful shutdown on SIGINT/SIGTERM:
 1. Stops all replication streams
 2. Flushes final LSN offsets to disk
 3. Closes all database connections
+
+## Error Handling & Recovery
+
+The application implements several error handling and recovery mechanisms:
+
+1. **Circuit Breaker Pattern**:
+   - Each database connection has its own circuit breaker
+   - After 5 consecutive failures, the circuit opens
+   - After 5 minutes, enters half-open state for testing
+   - Successful operations reset the circuit
+
+2. **Automatic Reconnection**:
+   - Automatic retry of failed database connections
+   - Exponential backoff for retry attempts
+   - Per-database error isolation
+   - LSN tracking ensures no data loss during disconnects
+
+3. **Runtime Recovery**:
+   - Automatic handling of network interruptions
+   - Recovery from database connection drops
+   - Message parsing error handling
+   - Standby status update retries
+
+4. **Error Metrics**:
+   - Tracks different types of errors
+   - Monitors error rates
+   - Provides error context in logs
