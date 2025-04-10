@@ -69,18 +69,26 @@ func ConnectDB(ctx context.Context, connStr string) (*pgconn.PgConn, error) {
 
 // EnsureReplicationSlot creates the replication slot if it doesn't exist.
 func EnsureReplicationSlot(ctx context.Context, conn *pgconn.PgConn, slotName, outputPlugin string) (created bool, err error) {
-	_, err = pglogrepl.CreateReplicationSlot(ctx, conn, slotName, outputPlugin, pglogrepl.CreateReplicationSlotOptions{Mode: pglogrepl.LogicalReplication})
+	// First check if the slot exists
+	checkQuery := fmt.Sprintf("SELECT 1 FROM pg_replication_slots WHERE slot_name = '%s'", slotName)
+	mrr := conn.Exec(ctx, checkQuery)
+	results, err := mrr.ReadAll()
 	if err != nil {
-		pgErr, ok := err.(*pgconn.PgError)
-		// 42710 is duplicate_object
-		if ok && pgErr.Code == "42710" {
-			log.Printf("Replication slot '%s' already exists.", slotName)
-			return false, nil // Slot already exists
-		}
-		return false, fmt.Errorf("failed to create replication slot '%s': %w", slotName, err)
+		return false, fmt.Errorf("failed to check for existing slot '%s': %w", slotName, err)
 	}
-	log.Printf("Replication slot '%s' created successfully.", slotName)
-	return true, nil
+
+	// If slot doesn't exist, create it
+	if len(results) == 0 || len(results[0].Rows) == 0 {
+		_, err = pglogrepl.CreateReplicationSlot(ctx, conn, slotName, outputPlugin, pglogrepl.CreateReplicationSlotOptions{Mode: pglogrepl.LogicalReplication})
+		if err != nil {
+			return false, fmt.Errorf("failed to create replication slot '%s': %w", slotName, err)
+		}
+		log.Printf("Replication slot '%s' created successfully.", slotName)
+		return true, nil
+	}
+
+	log.Printf("Replication slot '%s' already exists.", slotName)
+	return false, nil
 }
 
 // DropInactiveReplicationSlots finds and drops inactive logical replication slots.
