@@ -391,10 +391,18 @@ func isValidIdentifier(name string) bool {
 		return false
 	}
 
-	// Check for valid characters (letters, numbers, underscore)
-	for _, r := range name {
-		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_' {
-			return false
+	// For publication names, only allow letters, numbers, and underscore
+	// For table names, also allow dots for schema.table format
+	parts := strings.Split(name, ".")
+	if len(parts) > 2 {
+		return false
+	}
+
+	for _, part := range parts {
+		for _, r := range part {
+			if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_' {
+				return false
+			}
 		}
 	}
 
