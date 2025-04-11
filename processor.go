@@ -142,8 +142,8 @@ func parseTuple(rel *Relation, tupleData *pglogrepl.TupleData) (map[string]inter
 
 // createDebeziumMessage constructs the output message structure.
 func createDebeziumMessage(rel *Relation, before, after map[string]interface{}, op string, cfg *Config, commitTime time.Time, xid uint32) *DebeziumMessage {
-	commitTsMillis := commitTime.UnixMilli() // Use commit time from PG
-	processedLSN := GetCurrentLSN()          // Get LSN at the time of processing this specific change
+	commitTsMillis := commitTime.UnixMilli()         // Use commit time from PG
+	processedLSN := GetCurrentLSN(cfg.ConnectorName) // Get LSN at the time of processing this specific change
 
 	// Basic source info population (enhance as needed)
 	source := SourceInfo{

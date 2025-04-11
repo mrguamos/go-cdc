@@ -5,16 +5,19 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync"
 
 	"github.com/jackc/pglogrepl"
 
 	// "strconv" // Not needed if using LSN.String() and ParseLSN
 	"strings"
-	"sync/atomic"
 )
 
-// Atomically stores the current LSN that has been processed and can be flushed.
-var currentLSN atomic.Value // Stores pglogrepl.LSN
+// Map to store current LSN for each database
+var (
+	currentLSNs = make(map[string]pglogrepl.LSN)
+	lsnMu       sync.RWMutex
+)
 
 // LoadInitialLSN reads the LSN from the offset file and verifies it with PostgreSQL.
 // Returns 0 if the file doesn't exist or is invalid, or if the LSN has been recycled.
@@ -113,22 +116,16 @@ func SaveLSN(filePath string, lsn pglogrepl.LSN) error {
 	return nil
 }
 
-// GetCurrentLSN safely retrieves the current processed LSN.
-func GetCurrentLSN() pglogrepl.LSN {
-	val := currentLSN.Load()
-	if val == nil {
-		return 0
-	}
-	lsn, ok := val.(pglogrepl.LSN)
-	if !ok {
-		// This indicates a programming error (storing wrong type)
-		log.Printf("CRITICAL: Invalid type stored in atomic LSN. Expected pglogrepl.LSN, got %T", val)
-		return 0
-	}
-	return lsn
+// GetCurrentLSN safely retrieves the current processed LSN for a specific database.
+func GetCurrentLSN(connStr string) pglogrepl.LSN {
+	lsnMu.RLock()
+	defer lsnMu.RUnlock()
+	return currentLSNs[connStr]
 }
 
-// SetCurrentLSN safely updates the current processed LSN.
-func SetCurrentLSN(lsn pglogrepl.LSN) {
-	currentLSN.Store(lsn)
+// SetCurrentLSN safely updates the current processed LSN for a specific database.
+func SetCurrentLSN(connStr string, lsn pglogrepl.LSN) {
+	lsnMu.Lock()
+	defer lsnMu.Unlock()
+	currentLSNs[connStr] = lsn
 }

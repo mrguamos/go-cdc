@@ -277,7 +277,7 @@ func StartReplicationStream(ctx context.Context, conn *pgconn.PgConn, dbConfig D
 					}
 
 					lastProcessedLSN = xld.WALStart + pglogrepl.LSN(len(xld.WALData))
-					SetCurrentLSN(lastProcessedLSN)
+					SetCurrentLSN(dbConfig.ConnStr, lastProcessedLSN)
 
 				default:
 					log.Printf("WARN: Received unknown CopyData message type: %x", msg.Data[0])

@@ -228,6 +228,9 @@ func startActiveMode(cfg *Config) {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
+	// Create a WaitGroup to track all flushers
+	var flusherWg sync.WaitGroup
+
 	go func() {
 		sig := <-sigChan
 		log.Printf("Received signal: %v. Initiating shutdown...", sig)
@@ -247,7 +250,7 @@ func startActiveMode(cfg *Config) {
 
 			// Load initial offset
 			startLSN := LoadInitialLSN(offsetFile)
-			SetCurrentLSN(startLSN)
+			SetCurrentLSN(dbConfig.ConnStr, startLSN)
 
 			// Initialize database info
 			dbInfo := DatabaseInfo{
@@ -338,7 +341,7 @@ func startActiveMode(cfg *Config) {
 					if err != nil {
 						log.Printf("WARN: Failed to parse LSN for %s: %v", dbConfig.ConnStr, err)
 					} else {
-						SetCurrentLSN(lsn)
+						SetCurrentLSN(dbConfig.ConnStr, lsn)
 						// Save initial offset
 						if err := SaveLSN(offsetFile, lsn); err != nil {
 							log.Printf("WARN: Failed to save initial offset for %s: %v", dbConfig.ConnStr, err)
@@ -348,7 +351,6 @@ func startActiveMode(cfg *Config) {
 			}
 
 			// Start periodic LSN flusher
-			flusherWg := sync.WaitGroup{}
 			flusherWg.Add(1)
 			go func() {
 				defer flusherWg.Done()
@@ -359,25 +361,31 @@ func startActiveMode(cfg *Config) {
 				for {
 					select {
 					case <-ticker.C:
-						lsnToFlush := GetCurrentLSN()
+						lsnToFlush := GetCurrentLSN(dbConfig.ConnStr)
 						err := SaveLSN(offsetFile, lsnToFlush)
 						if err != nil {
 							log.Printf("ERROR: Periodic flush failed for %s: %v", dbConfig.ConnStr, err)
 						}
 					case <-ctx.Done():
-						log.Printf("Stopping periodic LSN flusher for %s", dbConfig.ConnStr)
+						// On shutdown, do one final flush
+						lsnToFlush := GetCurrentLSN(dbConfig.ConnStr)
+						if err := SaveLSN(offsetFile, lsnToFlush); err != nil {
+							log.Printf("ERROR: Final flush failed for %s: %v", dbConfig.ConnStr, err)
+						} else {
+							log.Printf("Successfully flushed final LSN %s for %s", lsnToFlush, dbConfig.ConnStr)
+						}
 						return
 					}
 				}
 			}()
 
 			// Start replication stream
-			err = StartReplicationStream(ctx, conn, dbConfig, GetCurrentLSN(), func(msg pglogrepl.Message) error {
+			err = StartReplicationStream(ctx, conn, dbConfig, GetCurrentLSN(dbConfig.ConnStr), func(msg pglogrepl.Message) error {
 				// Update last LSN
 				errorMetrics.mu.Lock()
 				for i, db := range errorMetrics.Databases {
 					if db.ConnStr == dbConfig.ConnStr {
-						errorMetrics.Databases[i].LastLSN = uint64(GetCurrentLSN())
+						errorMetrics.Databases[i].LastLSN = uint64(GetCurrentLSN(dbConfig.ConnStr))
 						errorMetrics.Databases[i].CircuitState = circuitBreakers[dbConfig.ConnStr].GetState()
 					}
 				}
@@ -399,9 +407,6 @@ func startActiveMode(cfg *Config) {
 				}
 				errorMetrics.mu.Unlock()
 			}
-
-			// Wait for flusher to stop
-			flusherWg.Wait()
 		}(dbConfig)
 	}
 
@@ -410,5 +415,8 @@ func startActiveMode(cfg *Config) {
 
 	// Wait for all database CDC processes to complete
 	wg.Wait()
+
+	// Wait for all flushers to complete their final flush
+	flusherWg.Wait()
 	log.Println("CDC tool shutdown complete.")
 }
