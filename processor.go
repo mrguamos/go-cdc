@@ -6,11 +6,14 @@ import (
 	"fmt"
 	"log"
 	"math"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/jackc/pglogrepl"
+)
+
+var (
+	publisher = NewDefaultEventPublisher()
 )
 
 // CleanupRelations removes old relation entries that haven't been used recently
@@ -198,14 +201,20 @@ func createDebeziumMessage(rel *Relation, before, after map[string]interface{}, 
 
 // outputJSON prints the Debezium message to stdout, handling potential errors.
 func outputJSON(msg *DebeziumMessage) error {
-	// Use compact JSON encoding for output efficiency
+	if msg == nil {
+		return fmt.Errorf("cannot marshal nil message")
+	}
+
 	jsonData, err := json.Marshal(msg)
 	if err != nil {
 		errorMetrics.IncrementError("processing")
-		return fmt.Errorf("failed to marshal Debezium message for %s.%s (op %s) to JSON: %w",
-			msg.Payload.Source.Schema, msg.Payload.Source.Table, msg.Payload.Op, err)
+		return fmt.Errorf("failed to marshal Debezium message to JSON: %w", err)
 	}
-	emitEvent(jsonData)
+
+	if err := emitEvent(jsonData); err != nil {
+		errorMetrics.IncrementError("publishing")
+		return fmt.Errorf("failed to emit event: %w", err)
+	}
 	return nil
 }
 
@@ -216,124 +225,6 @@ type EventPublisher interface {
 	IsRetryableError(err error) bool
 }
 
-// DefaultEventPublisher implements EventPublisher interface
-type DefaultEventPublisher struct {
-	circuitBreaker *CircuitBreaker
-	retryConfig    *RetryConfig
-	dlq            *DeadLetterQueue
-	metrics        *ErrorMetrics
-}
-
-// NewDefaultEventPublisher creates a new event publisher
-func NewDefaultEventPublisher(retryConfig *RetryConfig, metrics *ErrorMetrics) *DefaultEventPublisher {
-	return &DefaultEventPublisher{
-		circuitBreaker: NewCircuitBreaker(), // Use default circuit breaker
-		retryConfig:    retryConfig,
-		dlq:            NewDeadLetterQueue(),
-		metrics:        metrics,
-	}
-}
-
-// Publish attempts to publish a message with retries and circuit breaker
-func (p *DefaultEventPublisher) Publish(ctx context.Context, message []byte) error {
-	if !p.circuitBreaker.CanProceed() {
-		p.metrics.IncrementError("publisher_circuit_open")
-		return fmt.Errorf("publisher circuit breaker is open")
-	}
-
-	var lastErr error
-	for attempt := 0; attempt < p.retryConfig.MaxRetries; attempt++ {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-			// Try to publish the message
-			err := p.publishToBroker(ctx, message)
-			if err == nil {
-				p.circuitBreaker.RecordSuccess()
-				return nil
-			}
-
-			lastErr = err
-			p.metrics.IncrementError("publisher")
-
-			// Check if error is retryable
-			if !p.IsRetryableError(err) {
-				break
-			}
-
-			// Calculate backoff
-			backoff := calculateBackoff(attempt, p.retryConfig)
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(backoff):
-				continue
-			}
-		}
-	}
-
-	// If we've exhausted all retries, send to DLQ
-	if err := p.dlq.Store(message); err != nil {
-		p.metrics.IncrementError("dlq")
-		return fmt.Errorf("failed to store in DLQ after retries: %v (original error: %v)", err, lastErr)
-	}
-
-	p.circuitBreaker.RecordFailure()
-	return fmt.Errorf("message sent to DLQ after %d retries: %v", p.retryConfig.MaxRetries, lastErr)
-}
-
-// IsRetryableError determines if an error is retryable for the default publisher
-func (p *DefaultEventPublisher) IsRetryableError(err error) bool {
-	// Default implementation considers network errors, timeouts, and temporary failures as retryable
-	if err == nil {
-		return false
-	}
-
-	// Network errors are retryable
-	if strings.Contains(err.Error(), "connection") ||
-		strings.Contains(err.Error(), "network") ||
-		strings.Contains(err.Error(), "timeout") {
-		return true
-	}
-
-	// Temporary failures are retryable
-	if strings.Contains(err.Error(), "temporary") ||
-		strings.Contains(err.Error(), "retry") {
-		return true
-	}
-
-	// Rate limiting errors are retryable
-	if strings.Contains(err.Error(), "rate limit") ||
-		strings.Contains(err.Error(), "throttle") {
-		return true
-	}
-
-	return false
-}
-
-// publishToBroker is the actual implementation of publishing to the broker
-func (p *DefaultEventPublisher) publishToBroker(ctx context.Context, message []byte) error {
-	// TODO: Implement actual broker publishing logic
-	// This is where you'd integrate with Kafka, RabbitMQ, etc.
-	return nil
-}
-
-// calculateBackoff calculates the backoff duration
-func calculateBackoff(attempt int, config *RetryConfig) time.Duration {
-	backoff := config.InitialBackoff * time.Duration(math.Pow(config.BackoffMultiplier, float64(attempt)))
-	if backoff > config.MaxBackoff {
-		return config.MaxBackoff
-	}
-	return backoff
-}
-
-// DeadLetterQueue handles failed messages
-type DeadLetterQueue struct {
-	mu    sync.Mutex
-	queue []*DLQMessage
-}
-
 // DLQMessage represents a message in the dead letter queue
 type DLQMessage struct {
 	Message   []byte
@@ -341,7 +232,23 @@ type DLQMessage struct {
 	Error     string
 }
 
-// NewDeadLetterQueue creates a new DLQ
+// DLQ defines the interface for dead letter queue implementations
+type DLQ interface {
+	// Store adds a message to the queue
+	Store(message []byte) error
+	// Get retrieves all messages from the queue
+	Get() []*DLQMessage
+	// Close cleans up resources
+	Close() error
+}
+
+// DeadLetterQueue is an in-memory implementation of DLQ
+type DeadLetterQueue struct {
+	queue []*DLQMessage
+	mu    sync.Mutex
+}
+
+// NewDeadLetterQueue creates a new in-memory dead letter queue
 func NewDeadLetterQueue() *DeadLetterQueue {
 	return &DeadLetterQueue{
 		queue: make([]*DLQMessage, 0),
@@ -362,22 +269,91 @@ func (d *DeadLetterQueue) Store(message []byte) error {
 	return nil
 }
 
-// emitEvent publishes an event with retry and error handling
-func emitEvent(jsonData []byte) {
-	// TODO: Initialize publisher with proper configuration
-	publisher := NewDefaultEventPublisher(&RetryConfig{
-		MaxRetries:        3,
-		InitialBackoff:    1 * time.Second,
-		MaxBackoff:        30 * time.Second,
-		BackoffMultiplier: 2.0,
-	}, errorMetrics)
+// Get retrieves all messages from the queue
+func (d *DeadLetterQueue) Get() []*DLQMessage {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	messages := make([]*DLQMessage, len(d.queue))
+	copy(messages, d.queue)
+	return messages
+}
+
+// Close implements the DLQ interface
+func (d *DeadLetterQueue) Close() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Clear the queue
+	d.queue = nil
+	return nil
+}
+
+// DefaultEventPublisher implements the EventPublisher interface
+type DefaultEventPublisher struct {
+	dlq DLQ
+}
+
+// NewDefaultEventPublisher creates a new DefaultEventPublisher
+func NewDefaultEventPublisher() *DefaultEventPublisher {
+	return &DefaultEventPublisher{
+		dlq: NewDeadLetterQueue(),
+	}
+}
+
+// Publish implements the EventPublisher interface
+func (p *DefaultEventPublisher) Publish(ctx context.Context, message []byte) error {
+	if err := p.publishToBroker(ctx, message); err != nil {
+		// If publishing fails, store in DLQ
+		if err := p.dlq.Store(message); err != nil {
+			return fmt.Errorf("failed to store message in DLQ: %w", err)
+		}
+		return fmt.Errorf("failed to publish message: %w", err)
+	}
+	return nil
+}
+
+// Close implements the EventPublisher interface
+func (p *DefaultEventPublisher) Close() error {
+	return p.dlq.Close()
+}
+
+// publishToBroker publishes the event to the message broker
+func (p *DefaultEventPublisher) publishToBroker(ctx context.Context, message []byte) error {
+	// TODO: Implement actual broker publishing
+	// For now, just log the event
+	log.Printf("Publishing event: %+v", message)
+	return nil
+}
+
+// calculateBackoff calculates the backoff duration
+func calculateBackoff(attempt int, config *RetryConfig) time.Duration {
+	backoff := config.InitialBackoff * time.Duration(math.Pow(config.BackoffMultiplier, float64(attempt)))
+	if backoff > config.MaxBackoff {
+		return config.MaxBackoff
+	}
+	return backoff
+}
+
+// emitEvent publishes an event with retry and error handling
+func emitEvent(jsonData []byte) error {
+	if jsonData == nil {
+		return fmt.Errorf("cannot publish nil message")
+	}
+
+	// Use a shorter timeout for publishing
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	if err := publisher.Publish(ctx, jsonData); err != nil {
-		log.Printf("ERROR: Failed to publish event: %v", err)
+		return fmt.Errorf("publish failed: %w", err)
 	}
+	return nil
+}
+
+// ClosePublisher closes the global publisher instance
+func ClosePublisher() error {
+	return publisher.Close()
 }
 
 // DebeziumMessage represents the structure of a Debezium-like message

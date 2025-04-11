@@ -65,6 +65,7 @@ type ErrorMetrics struct {
 	ErrorRate        float64        `json:"error_rate"`
 	Databases        []DatabaseInfo `json:"databases"`
 	mu               sync.RWMutex   // Protects all fields
+	circuitBreakers  map[string]*CircuitBreaker
 }
 
 // NewErrorMetrics creates a new ErrorMetrics instance
@@ -74,28 +75,16 @@ func NewErrorMetrics() *ErrorMetrics {
 	}
 }
 
-// IncrementError increments the appropriate error counter
-func (em *ErrorMetrics) IncrementError(errorType string) {
-	em.mu.Lock()
-	defer em.mu.Unlock()
+// IncrementError increments the error count for a connection string
+func (e *ErrorMetrics) IncrementError(connStr string) {
+	e.mu.Lock()
+	// Get the circuit breaker before releasing the lock
+	cb, exists := e.circuitBreakers[connStr]
+	e.mu.Unlock()
 
-	em.TotalErrors++
-	switch errorType {
-	case "database":
-		em.DatabaseErrors++
-	case "processing":
-		em.ProcessingErrors++
-	case "file":
-		em.FileErrors++
+	if exists {
+		cb.RecordFailure()
 	}
-
-	// Update error rate (errors per minute)
-	now := time.Now()
-	minutes := now.Sub(em.LastErrorTime).Minutes()
-	if minutes > 0 {
-		em.ErrorRate = float64(em.TotalErrors) / minutes
-	}
-	em.LastErrorTime = now
 }
 
 // GetMetrics returns a copy of current metrics
