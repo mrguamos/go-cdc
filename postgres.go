@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -66,7 +67,8 @@ func ConnectDB(ctx context.Context, connStr string) (*pgconn.PgConn, error) {
 				time.Sleep(10 * time.Second)
 
 				// Try to clean up any stale replication slots
-				if cleanupConn, err := pgconn.Connect(ctx, connStr); err == nil {
+				cleanupConn, err := pgconn.Connect(ctx, connStr)
+				if err == nil {
 					defer cleanupConn.Close(ctx)
 					cleanupQuery := `
 						SELECT pg_terminate_backend(pid) 
@@ -142,6 +144,10 @@ func StartReplicationStream(ctx context.Context, conn *pgconn.PgConn, dbConfig D
 	// Get circuit breaker for this connection
 	cb := circuitBreakers[dbConfig.ConnStr]
 
+	// Track consecutive failures for exponential backoff
+	consecutiveFailures := 0
+	maxConsecutiveFailures := 5
+
 	for {
 		if !cb.CanProceed() {
 			log.Printf("Circuit breaker is open for %s, waiting before retry...", dbConfig.ConnStr)
@@ -157,13 +163,24 @@ func StartReplicationStream(ctx context.Context, conn *pgconn.PgConn, dbConfig D
 			errorMetrics.IncrementError("database")
 			log.Printf("Failed to ensure replication slot '%s' for %s: %v", dbConfig.SlotName, dbConfig.ConnStr, err)
 
-			// Try to reconnect
+			// Try to reconnect with exponential backoff
+			backoff := time.Duration(1<<uint(consecutiveFailures)) * time.Second
+			if backoff > 5*time.Minute {
+				backoff = 5 * time.Minute
+			}
+			time.Sleep(backoff)
+
 			newConn, err := ConnectDB(ctx, dbConfig.ConnStr)
 			if err != nil {
 				log.Printf("Failed to reconnect to %s: %v", dbConfig.ConnStr, err)
+				consecutiveFailures++
+				if consecutiveFailures >= maxConsecutiveFailures {
+					return fmt.Errorf("failed to reconnect after %d attempts: %w", maxConsecutiveFailures, err)
+				}
 				continue
 			}
 			conn = newConn
+			consecutiveFailures = 0
 			continue
 		}
 
@@ -179,18 +196,30 @@ func StartReplicationStream(ctx context.Context, conn *pgconn.PgConn, dbConfig D
 			errorMetrics.IncrementError("database")
 			log.Printf("Failed to start replication for %s: %v", dbConfig.ConnStr, err)
 
-			// Try to reconnect
+			// Try to reconnect with exponential backoff
+			backoff := time.Duration(1<<uint(consecutiveFailures)) * time.Second
+			if backoff > 5*time.Minute {
+				backoff = 5 * time.Minute
+			}
+			time.Sleep(backoff)
+
 			newConn, err := ConnectDB(ctx, dbConfig.ConnStr)
 			if err != nil {
 				log.Printf("Failed to reconnect to %s: %v", dbConfig.ConnStr, err)
+				consecutiveFailures++
+				if consecutiveFailures >= maxConsecutiveFailures {
+					return fmt.Errorf("failed to reconnect after %d attempts: %w", maxConsecutiveFailures, err)
+				}
 				continue
 			}
 			conn = newConn
+			consecutiveFailures = 0
 			continue
 		}
 
 		// Replication started successfully
 		cb.RecordSuccess()
+		consecutiveFailures = 0
 		log.Println("Replication stream started successfully")
 
 		lastProcessedLSN := startLSN
@@ -290,14 +319,31 @@ func StartReplicationStream(ctx context.Context, conn *pgconn.PgConn, dbConfig D
 		newConn, err := ConnectDB(ctx, dbConfig.ConnStr)
 		if err != nil {
 			log.Printf("Failed to reconnect to %s: %v", dbConfig.ConnStr, err)
+			consecutiveFailures++
+			if consecutiveFailures >= maxConsecutiveFailures {
+				return fmt.Errorf("failed to reconnect after %d attempts: %w", maxConsecutiveFailures, err)
+			}
 			continue
 		}
 		conn = newConn
+		consecutiveFailures = 0
 	}
 }
 
 // EnsurePublication creates a publication for the specified tables if it doesn't exist.
 func EnsurePublication(ctx context.Context, conn *pgconn.PgConn, publicationName string, tables []string) error {
+	// Validate publication name
+	if !isValidIdentifier(publicationName) {
+		return fmt.Errorf("invalid publication name: %s", publicationName)
+	}
+
+	// Validate table names
+	for _, table := range tables {
+		if !isValidIdentifier(table) {
+			return fmt.Errorf("invalid table name: %s", table)
+		}
+	}
+
 	// First check if publication exists
 	checkQuery := fmt.Sprintf("SELECT 1 FROM pg_publication WHERE pubname = '%s'", publicationName)
 	mrr := conn.Exec(ctx, checkQuery)
@@ -334,48 +380,112 @@ func EnsurePublication(ctx context.Context, conn *pgconn.PgConn, publicationName
 	return nil
 }
 
-// PerformInitialSnapshot performs a snapshot of the current table data
+// isValidIdentifier checks if a string is a valid PostgreSQL identifier
+func isValidIdentifier(name string) bool {
+	if name == "" {
+		return false
+	}
+
+	// Check for SQL injection attempts
+	if strings.ContainsAny(name, "';\"\\") {
+		return false
+	}
+
+	// Check for valid characters (letters, numbers, underscore)
+	for _, r := range name {
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_' {
+			return false
+		}
+	}
+
+	return true
+}
+
+// PerformInitialSnapshot performs a snapshot of the current table data with retry logic
 func PerformInitialSnapshot(ctx context.Context, conn *pgconn.PgConn, dbConfig DatabaseConfig) error {
-	for _, table := range dbConfig.Tables {
-		// Split table name into schema and table name
-		parts := strings.Split(table, ".")
-		if len(parts) != 2 {
-			return fmt.Errorf("invalid table format: %s, expected schema.table", table)
-		}
-		schema, tableName := parts[0], parts[1]
+	cfg := LoadConfig()
+	var lastErr error
 
-		// Query to get all rows from the table
-		query := fmt.Sprintf("SELECT * FROM %s.%s", schema, tableName)
-		mrr := conn.Exec(ctx, query)
-		results, err := mrr.ReadAll()
-		if err != nil {
-			return fmt.Errorf("failed to query table %s: %w", table, err)
-		}
+	// Retry the entire snapshot process
+	for attempt := 0; attempt < cfg.RetryConfig.MaxRetries; attempt++ {
+		lastErr = nil
+		for _, table := range dbConfig.Tables {
+			// Split table name into schema and table name
+			parts := strings.Split(table, ".")
+			if len(parts) != 2 {
+				lastErr = fmt.Errorf("invalid table format: %s, expected schema.table", table)
+				break
+			}
+			schema, tableName := parts[0], parts[1]
 
-		// Process each row
-		for _, result := range results {
-			for _, row := range result.Rows {
-				values := make(map[string]interface{})
-				for i, col := range result.FieldDescriptions {
-					values[col.Name] = string(row[i])
+			// Query to get all rows from the table
+			query := fmt.Sprintf("SELECT * FROM %s.%s", schema, tableName)
+			mrr := conn.Exec(ctx, query)
+			results, err := mrr.ReadAll()
+			if err != nil {
+				lastErr = fmt.Errorf("failed to query table %s: %w", table, err)
+				break
+			}
+
+			// Process each row
+			for _, result := range results {
+				for _, row := range result.Rows {
+					values := make(map[string]interface{})
+					for i, col := range result.FieldDescriptions {
+						values[col.Name] = string(row[i])
+					}
+
+					// Create a relation message for the table
+					rel := &Relation{
+						ID:        0, // Not used for snapshot
+						Namespace: schema,
+						Name:      tableName,
+					}
+
+					// Create and output Debezium message
+					dbzMsg, err := createDebeziumMessage(rel, nil, values, "r", &Config{
+						ConnectorName: dbConfig.PublicationName,
+					}, time.Now(), 0)
+					if err != nil {
+						lastErr = fmt.Errorf("failed to create Debezium message for table %s: %w", table, err)
+						break
+					}
+					if err := outputJSON(dbzMsg); err != nil {
+						lastErr = fmt.Errorf("failed to output JSON for table %s: %w", table, err)
+						break
+					}
 				}
-
-				// Create a relation message for the table
-				rel := &Relation{
-					ID:        0, // Not used for snapshot
-					Namespace: schema,
-					Name:      tableName,
+				if lastErr != nil {
+					break
 				}
+			}
+			if lastErr != nil {
+				break
+			}
+		}
 
-				// Create and output Debezium message
-				dbzMsg := createDebeziumMessage(rel, nil, values, "r", &Config{
-					ConnectorName: dbConfig.PublicationName,
-				}, time.Now(), 0)
-				outputJSON(dbzMsg)
+		if lastErr == nil {
+			// Successfully completed snapshot
+			return nil
+		}
+
+		// If we have more attempts left, wait before retrying
+		if attempt < cfg.RetryConfig.MaxRetries-1 {
+			log.Printf("Snapshot attempt %d/%d failed: %v. Retrying in %v...",
+				attempt+1, cfg.RetryConfig.MaxRetries, lastErr, cfg.RetryConfig.InitialBackoff)
+
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("snapshot cancelled: %w", ctx.Err())
+			case <-time.After(cfg.RetryConfig.InitialBackoff):
+				// Continue to next attempt
 			}
 		}
 	}
-	return nil
+
+	// If we get here, all attempts failed
+	return fmt.Errorf("failed to complete initial snapshot after %d attempts: %w",
+		cfg.RetryConfig.MaxRetries, lastErr)
 }
 
 // RetryWithBackoff executes a function with exponential backoff retry

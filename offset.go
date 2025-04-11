@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/jackc/pglogrepl"
 
@@ -44,19 +45,23 @@ func LoadInitialLSN(filePath string) pglogrepl.LSN {
 		return 0
 	}
 
+	// Create a context with timeout for database operations
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
 	// Connect to PostgreSQL to verify the LSN
 	cfg := LoadConfig()
 	for _, dbConfig := range cfg.Databases {
-		conn, err := ConnectDB(context.Background(), dbConfig.ConnStr)
+		conn, err := ConnectDB(ctx, dbConfig.ConnStr)
 		if err != nil {
 			log.Printf("Failed to connect to database to verify LSN: %v", err)
 			continue
 		}
-		defer conn.Close(context.Background())
+		defer conn.Close(ctx)
 
 		// Get the current WAL position
 		query := "SELECT pg_current_wal_lsn()"
-		mrr := conn.Exec(context.Background(), query)
+		mrr := conn.Exec(ctx, query)
 		results, err := mrr.ReadAll()
 		if err != nil {
 			log.Printf("Failed to get current WAL position: %v", err)

@@ -16,11 +16,12 @@ type DatabaseConfig struct {
 }
 
 type Config struct {
-	ConnectorName string           `yaml:"connector_name"`
-	FlushInterval time.Duration    `yaml:"flush_interval"`
-	OffsetFile    string           `yaml:"offset_file"`
-	Databases     []DatabaseConfig `yaml:"databases"`
-	RetryConfig   RetryConfig      `yaml:"retry_config"`
+	ConnectorName       string           `yaml:"connector_name"`
+	FlushInterval       time.Duration    `yaml:"flush_interval"`
+	OffsetFile          string           `yaml:"offset_file"`
+	Databases           []DatabaseConfig `yaml:"databases"`
+	RetryConfig         RetryConfig      `yaml:"retry_config"`
+	FailOnSnapshotError bool             `yaml:"fail_on_snapshot_error"`
 }
 
 // RetryConfig defines retry behavior for various operations

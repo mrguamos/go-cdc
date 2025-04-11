@@ -326,7 +326,11 @@ func startActiveMode(cfg *Config) {
 			if startLSN == 0 {
 				// Perform initial snapshot of tables
 				if err := PerformInitialSnapshot(ctx, conn, dbConfig); err != nil {
-					log.Printf("WARN: Failed to perform initial snapshot for %s: %v", dbConfig.ConnStr, err)
+					if cfg.FailOnSnapshotError {
+						log.Printf("FATAL: Failed to perform initial snapshot for %s: %v", dbConfig.ConnStr, err)
+						return
+					}
+					log.Printf("WARN: Failed to perform initial snapshot for %s: %v. Continuing with replication...", dbConfig.ConnStr, err)
 				}
 
 				// Get the current LSN after snapshot

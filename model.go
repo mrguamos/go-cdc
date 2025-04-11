@@ -40,6 +40,7 @@ type Relation struct {
 	Name            string                            // Table name
 	Columns         []pglogrepl.RelationMessageColumn // Column definitions
 	ReplicaIdentity uint8                             // From RelationMessage.ReplicaIdentity ('d'=default, 'n'=nothing, 'f'=full, 'i'=index)
+	LastAccessTime  time.Time                         // Track last access time for cleanup
 }
 
 // DatabaseInfo tracks information about a database connection
@@ -153,8 +154,8 @@ func (cb *CircuitBreaker) RecordSuccess() {
 
 // CanProceed checks if the circuit breaker allows the operation
 func (cb *CircuitBreaker) CanProceed() bool {
-	cb.mu.RLock()
-	defer cb.mu.RUnlock()
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
 
 	if cb.State == "closed" {
 		return true
@@ -162,9 +163,7 @@ func (cb *CircuitBreaker) CanProceed() bool {
 
 	// If circuit is open, check if enough time has passed to try again
 	if cb.State == "open" && time.Since(cb.LastFailureTime) > 5*time.Minute {
-		cb.mu.Lock()
 		cb.State = "half-open"
-		cb.mu.Unlock()
 		return true
 	}
 
