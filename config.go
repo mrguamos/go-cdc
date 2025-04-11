@@ -16,12 +16,11 @@ type DatabaseConfig struct {
 }
 
 type Config struct {
-	ConnectorName     string           `yaml:"connector_name"`
-	FlushInterval     time.Duration    `yaml:"flush_interval"`
-	OffsetFile        string           `yaml:"offset_file"`
-	InactiveSlotCheck bool             `yaml:"inactive_slot_check"`
-	Databases         []DatabaseConfig `yaml:"databases"`
-	RetryConfig       RetryConfig      `yaml:"retry_config"`
+	ConnectorName string           `yaml:"connector_name"`
+	FlushInterval time.Duration    `yaml:"flush_interval"`
+	OffsetFile    string           `yaml:"offset_file"`
+	Databases     []DatabaseConfig `yaml:"databases"`
+	RetryConfig   RetryConfig      `yaml:"retry_config"`
 }
 
 // RetryConfig defines retry behavior for various operations

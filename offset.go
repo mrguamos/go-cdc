@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -15,8 +16,8 @@ import (
 // Atomically stores the current LSN that has been processed and can be flushed.
 var currentLSN atomic.Value // Stores pglogrepl.LSN
 
-// LoadInitialLSN reads the LSN from the offset file.
-// Returns 0 if the file doesn't exist or is invalid.
+// LoadInitialLSN reads the LSN from the offset file and verifies it with PostgreSQL.
+// Returns 0 if the file doesn't exist or is invalid, or if the LSN has been recycled.
 func LoadInitialLSN(filePath string) pglogrepl.LSN {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
@@ -40,8 +41,47 @@ func LoadInitialLSN(filePath string) pglogrepl.LSN {
 		return 0
 	}
 
-	log.Printf("Resuming replication from LSN %s found in '%s'", lsn, filePath)
-	return lsn
+	// Connect to PostgreSQL to verify the LSN
+	cfg := LoadConfig()
+	for _, dbConfig := range cfg.Databases {
+		conn, err := ConnectDB(context.Background(), dbConfig.ConnStr)
+		if err != nil {
+			log.Printf("Failed to connect to database to verify LSN: %v", err)
+			continue
+		}
+		defer conn.Close(context.Background())
+
+		// Get the current WAL position
+		query := "SELECT pg_current_wal_lsn()"
+		mrr := conn.Exec(context.Background(), query)
+		results, err := mrr.ReadAll()
+		if err != nil {
+			log.Printf("Failed to get current WAL position: %v", err)
+			continue
+		}
+
+		if len(results) > 0 && len(results[0].Rows) > 0 {
+			currentLSNStr := string(results[0].Rows[0][0])
+			currentLSN, err := pglogrepl.ParseLSN(currentLSNStr)
+			if err != nil {
+				log.Printf("Failed to parse current WAL position: %v", err)
+				continue
+			}
+
+			// If our saved LSN is older than the current WAL position, it's still valid
+			if lsn <= currentLSN {
+				log.Printf("Resuming replication from LSN %s found in '%s'", lsn, filePath)
+				return lsn
+			}
+
+			log.Printf("Saved LSN %s is newer than current WAL position %s, starting from scratch", lsn, currentLSN)
+			return 0
+		}
+	}
+
+	// If we couldn't verify with any database, start from scratch
+	log.Printf("Could not verify LSN with any database, starting from scratch (LSN 0)")
+	return 0
 }
 
 // SaveLSN writes the current LSN to the offset file atomically.

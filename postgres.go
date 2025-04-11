@@ -117,13 +117,6 @@ func EnsureReplicationSlot(ctx context.Context, conn *pgconn.PgConn, slotName, o
 
 	// If slot doesn't exist, create it
 	if len(results) == 0 || len(results[0].Rows) == 0 {
-		// Drop any existing slot with the same name (in case it's in an invalid state)
-		dropQuery := fmt.Sprintf("SELECT pg_drop_replication_slot('%s')", slotName)
-		_, _ = conn.Exec(ctx, dropQuery).ReadAll() // Ignore error as slot might not exist
-
-		// Wait a bit to ensure the drop is processed
-		time.Sleep(1 * time.Second)
-
 		// Create the slot
 		_, err = pglogrepl.CreateReplicationSlot(ctx, conn, slotName, outputPlugin, pglogrepl.CreateReplicationSlotOptions{Mode: pglogrepl.LogicalReplication})
 		if err != nil {
@@ -140,55 +133,6 @@ func EnsureReplicationSlot(ctx context.Context, conn *pgconn.PgConn, slotName, o
 
 	log.Printf("Replication slot '%s' already exists.", slotName)
 	return false, nil
-}
-
-// DropInactiveReplicationSlots finds and drops inactive logical replication slots.
-// BE CAREFUL: This might drop slots used by other tools. Consider adding a prefix check.
-func DropInactiveReplicationSlots(ctx context.Context, conn *pgconn.PgConn, currentSlotName string) error {
-	log.Println("Checking for inactive replication slots to drop...")
-	// Query to find inactive logical slots. Add WHERE slot_name LIKE 'prefix_%' if needed.
-	query := "SELECT slot_name FROM pg_replication_slots WHERE slot_type = 'logical' AND active = 'f'"
-	mrr := conn.Exec(ctx, query)
-	results, err := mrr.ReadAll()
-	if err != nil {
-		return fmt.Errorf("failed to query inactive replication slots: %w", err)
-	}
-
-	if len(results) == 0 || len(results[0].Rows) == 0 {
-		log.Println("No inactive logical replication slots found.")
-		return nil
-	}
-
-	for _, row := range results[0].Rows {
-		if len(row) == 0 || row[0] == nil {
-			continue // Skip empty rows/cells
-		}
-		slotNameToDrop := string(row[0])
-		if slotNameToDrop == currentSlotName {
-			log.Printf("Skipping drop of own slot '%s' (it might appear inactive briefly).", currentSlotName)
-			continue
-		}
-
-		// Optional: Add prefix check here
-		// if !strings.HasPrefix(slotNameToDrop, "my_cdc_prefix_") {
-		//     log.Printf("Skipping drop of slot '%s' as it doesn't match the expected prefix.", slotNameToDrop)
-		//     continue
-		// }
-
-		log.Printf("Attempting to drop inactive replication slot: %s", slotNameToDrop)
-		// Use proper SQL escaping by doubling single quotes
-		escapedSlotName := strings.ReplaceAll(slotNameToDrop, "'", "''")
-		dropQuery := fmt.Sprintf("SELECT pg_drop_replication_slot('%s');", escapedSlotName)
-		dropMrr := conn.Exec(ctx, dropQuery)
-		_, err := dropMrr.ReadAll() // Execute and ignore result unless error
-		if err != nil {
-			// Log error but continue trying others
-			log.Printf("WARN: Failed to drop inactive replication slot '%s': %v", slotNameToDrop, err)
-		} else {
-			log.Printf("Successfully dropped inactive replication slot: %s", slotNameToDrop)
-		}
-	}
-	return nil
 }
 
 // StartReplicationStream starts the logical replication process with automatic recovery
@@ -249,9 +193,6 @@ func StartReplicationStream(ctx context.Context, conn *pgconn.PgConn, dbConfig D
 		cb.RecordSuccess()
 		log.Println("Replication stream started successfully")
 
-		// Use a separate timer for sending standby status updates
-		standbyUpdateInterval := 10 * time.Second
-		nextStandbyStatusUpdateTime := time.Now().Add(standbyUpdateInterval)
 		lastProcessedLSN := startLSN
 
 		for {
@@ -260,7 +201,7 @@ func StartReplicationStream(ctx context.Context, conn *pgconn.PgConn, dbConfig D
 				return ctx.Err()
 			}
 
-			receiveCtx, cancelReceive := context.WithTimeout(ctx, standbyUpdateInterval)
+			receiveCtx, cancelReceive := context.WithTimeout(ctx, 10*time.Second)
 			rawMsg, err := conn.ReceiveMessage(receiveCtx)
 			cancelReceive()
 
@@ -301,7 +242,16 @@ func StartReplicationStream(ctx context.Context, conn *pgconn.PgConn, dbConfig D
 					}
 
 					if pkm.ReplyRequested {
-						nextStandbyStatusUpdateTime = time.Now()
+						err = pglogrepl.SendStandbyStatusUpdate(ctx, conn, pglogrepl.StandbyStatusUpdate{
+							WALWritePosition: lastProcessedLSN,
+							WALFlushPosition: lastProcessedLSN,
+							WALApplyPosition: lastProcessedLSN,
+						})
+						if err != nil {
+							cb.RecordFailure()
+							log.Printf("Failed to send standby status update for %s: %v", dbConfig.ConnStr, err)
+							break // Break inner loop to attempt reconnection
+						}
 					}
 
 				case pglogrepl.XLogDataByteID:
@@ -333,26 +283,6 @@ func StartReplicationStream(ctx context.Context, conn *pgconn.PgConn, dbConfig D
 					log.Printf("WARN: Received unknown CopyData message type: %x", msg.Data[0])
 				}
 			}
-
-			// Update standby status with retry
-			now := time.Now()
-			if now.After(nextStandbyStatusUpdateTime) || (rawMsg != nil && rawMsg.(*pgproto3.CopyData).Data[0] == pglogrepl.PrimaryKeepaliveMessageByteID && mustReplyToKeepalive(rawMsg.(*pgproto3.CopyData).Data)) {
-				if lastProcessedLSN > 0 {
-					err = RetryWithBackoff(ctx, LoadConfig(), "send standby status", func() error {
-						return pglogrepl.SendStandbyStatusUpdate(ctx, conn, pglogrepl.StandbyStatusUpdate{
-							WALWritePosition: lastProcessedLSN,
-							WALFlushPosition: lastProcessedLSN,
-							WALApplyPosition: lastProcessedLSN,
-						})
-					})
-					if err != nil {
-						cb.RecordFailure()
-						log.Printf("Failed to send standby status update for %s: %v", dbConfig.ConnStr, err)
-						break // Break inner loop to attempt reconnection
-					}
-				}
-				nextStandbyStatusUpdateTime = now.Add(standbyUpdateInterval)
-			}
 		}
 
 		// If we get here, we need to reconnect
@@ -364,15 +294,6 @@ func StartReplicationStream(ctx context.Context, conn *pgconn.PgConn, dbConfig D
 		}
 		conn = newConn
 	}
-}
-
-// Helper to check if keepalive requested reply
-func mustReplyToKeepalive(data []byte) bool {
-	if len(data) < 2 {
-		return false
-	} // Basic sanity check
-	pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(data[1:])
-	return err == nil && pkm.ReplyRequested
 }
 
 // EnsurePublication creates a publication for the specified tables if it doesn't exist.

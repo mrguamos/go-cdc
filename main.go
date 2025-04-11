@@ -305,14 +305,6 @@ func startActiveMode(cfg *Config) {
 				errorMetrics.mu.Unlock()
 			}()
 
-			// Drop stale slots if enabled
-			if cfg.InactiveSlotCheck {
-				err = DropInactiveReplicationSlots(ctx, conn, dbConfig.SlotName)
-				if err != nil {
-					log.Printf("WARN: Failed during inactive slot check for %s: %v", dbConfig.ConnStr, err)
-				}
-			}
-
 			// Ensure replication slot exists
 			_, err = EnsureReplicationSlot(ctx, conn, dbConfig.SlotName, "pgoutput")
 			if err != nil {
